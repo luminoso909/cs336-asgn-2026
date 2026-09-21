@@ -1,7 +1,6 @@
 from typing import Iterable, Iterator
 import pickle
 import regex as re
-from cs336_basics.bpe import BPE
 
 PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
 
@@ -16,9 +15,9 @@ class Tokenizer:
         self.merges = merges
         self.special_tokens = special_tokens if special_tokens else []
         self.reversed_vocab = {v:k for k, v in self.vocab.items()}
-        self.safe_token = ['', ' ', '\n']
+        self.safe_token = [' ', '\n']
 
-        if special_tokens:
+        if special_tokens is not None:
             for token in special_tokens:
                 token_byte = token.encode('utf-8')
                 if token_byte not in self.reversed_vocab:
@@ -79,23 +78,6 @@ class Tokenizer:
         return word_ids
         
 
-    # def merge_byte(self, word_byte:tuple[bytes, ...], merges:list[tuple[bytes, bytes]]) -> tuple[bytes, ...]:
-    #     new_word_byte = [word_byte[0]]
-
-    #     i = 0
-    #     j = 1
-    #     while j < len(word_byte):
-
-    #         if (new_word_byte[i], word_byte[j]) in merges:
-    #             new_word_byte.append(new_word_byte[i]+word_byte[j])
-    #             new_word_byte.pop(i)
-    #         else:
-    #             new_word_byte.append(word_byte[j])
-    #             i += 1
-    #         j += 1
-
-    #     return tuple(new_word_byte)
-
     def merge_byte(self, word_byte, merges):
         for pair in merges:              # ← 外层是 merges，不是 word_byte
             new_word_byte = []
@@ -112,19 +94,16 @@ class Tokenizer:
 
     def encode_iterable(self, iterable: Iterable[str]) -> Iterator[int]:
         buffer = ""
-        
+
         for line in iterable:
             buffer += line
 
             if buffer[-1] in self.safe_token:
-                for token_id in self.encode(buffer):
-                    yield token_id
+                yield from self.encode(buffer)
                 buffer = ""
 
         if buffer:
-            for token_id in self.encode(buffer):
-                yield token_id
-
+            yield from self.encode(buffer)
 
     def decode(self, word_ids: list[int]) -> str:
         byte_list = [self.vocab[i] for i in word_ids]
