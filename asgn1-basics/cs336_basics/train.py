@@ -73,7 +73,7 @@ def main():
     # 2 初始化模型、优化器、调度器
     model = TransformerLM(
         vocab_size = args.vocab_size, 
-        context_length = args.vocab_size, 
+        context_length = args.context_length, 
         num_layers = args.num_layers, 
         d_model = args.d_model, 
         num_heads = args.num_heads, 
@@ -89,14 +89,14 @@ def main():
         weight_decay = args.weight_decay)
 
 
-    start_iter = 0
+    start_iter = 1
     if os.path.exists(os.path.join(args.checkpoint_path, 'latest.pt')):
-        start_iter = load_checkpoint('latest.pt', model, optimizer)
-        print(f"Resumed from iteration {start_iter}")
+        start_iter, start_loss = load_checkpoint(os.path.join(args.checkpoint_path, 'latest.pt'), model, optimizer)
+        print(f"Resumed from iteration {start_iter}, loss {start_loss}")
 
     # 3 训练循环
     model.train()
-    for iteration in range(start_iter, args.max_iters):
+    for iteration in range(start_iter, args.max_iters+1):
         lr = learning_rate_schedule(iteration, args.lr_max, args.lr_min, args.warmup_iters, args.max_iters)
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr
@@ -128,8 +128,8 @@ def main():
             model.train()
 
         if iteration % args.save_interval == 0 and iteration > 0:
-            save_checkpoint(model, optimizer, iteration, os.path.join(args.checkpoint_path, f"save_{iteration}.pt"))
-            save_checkpoint(model, optimizer, iteration, os.path.join(args.checkpoint_path, "latest.pt"))
+            save_checkpoint(model, optimizer, iteration, os.path.join(args.checkpoint_path, f"save_{iteration}.pt"), loss = loss.item())
+            save_checkpoint(model, optimizer, iteration, os.path.join(args.checkpoint_path, "latest.pt"), loss = loss.item())
 
 
 @torch.no_grad()

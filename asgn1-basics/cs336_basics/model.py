@@ -303,3 +303,87 @@ class TransformerLM(nn.Module):
 
         out = self.linear(self.norm(in_features))
         return out
+
+    @torch.no_grad()
+    def generate(
+        self,
+        prompt: Int[Tensor, "batch prompt_len"],
+        max_new_tokens: int,
+        temperature: float = 1.0,
+        top_p: float = 1.0,
+        eos_token_id: int | None = None,
+    ) -> Int[Tensor, "batch total_len"]:
+        """
+        自回归生成。
+        prompt:           (batch, prompt_len) 的 LongTensor（已 encode 的 token id）
+        max_new_tokens:   最多生成多少个新 token
+        temperature:      采样温度，越小越确定；= 0 时退化为贪心
+        top_p:            nucleus sampling 阈值，1.0 表示不启用
+        eos_token_id:     遇到它则标记该序列结束（整 batch 都结束就提前 break）
+        """
+        was_training = self.training
+        self.eval()
+        device = prompt.device
+        out = prompt
+
+        # 每个样本是否已经产生了 EOS
+        finished = torch.zeros(prompt.shape[0], dtype=torch.bool, device=device)
+
+        for _ in range(max_new_tokens):
+            # 1. 只保留最后 context_length 个 token
+            idx = out[:, -self.context_length:]
+
+            # 2. 取最后一个位置的 logits
+            logits = self(idx)[:, -1, :]            # (batch, vocab_size)
+
+            # 3. temperature 缩放
+            if temperature > 0:
+                logits = logits / temperature
+
+            # 4. 采样
+            if temperature == 0:
+                next_token = logits.argmax(dim=-1, keepdim=True)   # (batch, 1)
+            else:
+                if top_p < 1.0:
+                    logits = top_p_filter(logits, top_p)
+                probs = torch.softmax(logits, dim=-1)
+                next_token = torch.multinomial(probs, num_samples=1)  # (batch, 1)
+
+            # 5. 已经结束的序列，之后一直输出 EOS
+            if eos_token_id is not None:
+                next_token = torch.where(
+                    finished.unsqueeze(-1),
+                    torch.full_like(next_token, eos_token_id),
+                    next_token,
+                )
+                finished = finished | (next_token.squeeze(-1) == eos_token_id)
+
+            out = torch.cat([out, next_token], dim=1)
+
+            # 6. 全部结束就提前退出
+            if eos_token_id is not None and finished.all():
+                break
+
+        if was_training:
+            self.train()
+        return out
+
+def top_p_filter(
+    logits: Float[Tensor, "batch vocab"],
+    top_p: float,
+) -> Float[Tensor, "batch vocab"]:
+    """Nucleus sampling：只保留累计概率达到 top_p 的最小 token 集合，其余置为 -inf。"""
+    # 按 logits 降序排序
+    sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
+    sorted_probs = torch.softmax(sorted_logits, dim=-1)
+    cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+
+    # 累计概率超过 top_p 的 token 都丢掉（右移一位，保留第一个越过阈值的 token）
+    sorted_mask = cumulative_probs > top_p
+    sorted_mask[..., 1:] = sorted_mask[..., :-1].clone()
+    sorted_mask[..., 0] = False
+
+    sorted_logits = sorted_logits.masked_fill(sorted_mask, float("-inf"))
+
+    # 把顺序还原到原 vocab 索引
+    return torch.empty_like(sorted_logits).scatter_(-1, sorted_indices, sorted_logits)
