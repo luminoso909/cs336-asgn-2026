@@ -14,7 +14,7 @@ def cross_entropy(
 ) -> Float[Tensor, ""]:
     max_input = input.max(dim = -1, keepdim = True).values      # 或用 torch.amax() 不返回下标，只返回最大值
     stable_input = input - max_input
-    log_sum_exp = max_input + torch.log(torch.sum(torch.exp(stable_input), dim = -1, keepdim = True))
+    log_sum_exp = max_input + torch.log(torch.sum(torch.exp(stable_input), dim = -1))
     correct_logits = input[torch.arange(targets.shape[0]), targets]
     # 或者用 gather 方法：correct_logits = input.gather(1, rearrange(targets, "batch_size -> batch_size 1"))
     loss = log_sum_exp - correct_logits
@@ -135,9 +135,7 @@ def learning_rate_schedule(
     else:
         return min_learning_rate
 
-def gradient_clipping(parameters:Iterable[torch.nn.Parameter], max_l2_norm:float):
-    eps = 1e-6
-
+def gradient_clipping(parameters:Iterable[torch.nn.Parameter], max_l2_norm:float, eps:float = 1e-6):
     # 合并所有梯度拼成一个长向量 g
     grads = [param.grad for param in parameters if param.grad is not None]
     if not grads: return

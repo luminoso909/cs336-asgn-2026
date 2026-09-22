@@ -174,7 +174,7 @@ class MultiheadSelfAttention(nn.Module):
             d_model:int, 
             num_heads:int, 
             max_seq_len:int | None = None, 
-            theta:int = 10000.0
+            theta:float = 10000.0
     ):
         super().__init__()
         self.d_model = d_model
@@ -194,21 +194,11 @@ class MultiheadSelfAttention(nn.Module):
         self.sdpa = ScaledDotProductAttention()
 
 
-    def forward(
-            self, 
-            q_proj_weight: Float[Tensor, "d_model d_model"],
-            k_proj_weight: Float[Tensor, "d_model d_model"],
-            v_proj_weight: Float[Tensor, "d_model d_model"],
-            o_proj_weight: Float[Tensor, "d_model d_model"],
+    def forward(self, 
             in_features: Float[Tensor, "... seq_len d_model"],
             token_positions: Int[Tensor, " ... sequence_length"] | None = None,
     ) -> Float[Tensor, "... seq_len d_model"]:
     
-        with torch.no_grad():
-            self.w_q.weight.copy_(q_proj_weight)
-            self.w_k.weight.copy_(k_proj_weight)
-            self.w_v.weight.copy_(v_proj_weight)
-            self.w_o.weight.copy_(o_proj_weight)
 
         # 这三个矩阵的形状都为 (..., seq_len, d_model) = (..., seq_len, d_model) @ (d_model, d_model)
         Q = self.w_q(in_features)
@@ -243,7 +233,7 @@ class TransformerBlock(nn.Module):
             num_heads:int, 
             d_ff:int, 
             max_seq_len:int | None = None, 
-            theta:int = 10000.0, 
+            theta:float = 10000.0, 
     ):
         super().__init__()
         self.d_model = d_model
@@ -260,31 +250,14 @@ class TransformerBlock(nn.Module):
         self.norm2 = RMSNorm(d_model)
 
     def forward(self, 
-            weights:dict[str, Tensor], 
             in_features: Float[Tensor, "batch sequence_length d_model"]
     ) -> Float[Tensor, "batch sequence_length d_model"]:
-            
-        with torch.no_grad():
-            self.ffn.w1.weight.copy_(weights['ffn.w1.weight'])
-            self.ffn.w2.weight.copy_(weights['ffn.w2.weight'])
-            self.ffn.w3.weight.copy_(weights['ffn.w3.weight'])
-            self.norm1.gains.copy_(weights['ln1.weight'])
-            self.norm2.gains.copy_(weights['ln2.weight'])
-
 
         seq_len = in_features.shape[-2]
         token_positions = torch.arange(seq_len, device=in_features.device)
         
-        sublayer1 = in_features + self.msa(
-                            weights['attn.q_proj.weight'], 
-                            weights['attn.k_proj.weight'], 
-                            weights['attn.v_proj.weight'], 
-                            weights['attn.output_proj.weight'], 
-                            self.norm1(in_features), 
-                            token_positions = token_positions)
-        
+        sublayer1 = in_features + self.msa(self.norm1(in_features), token_positions = token_positions)
         sublayer2 = sublayer1 + self.ffn(self.norm2(sublayer1))
-
         return sublayer2
 
 class TransformerLM(nn.Module):
@@ -296,7 +269,7 @@ class TransformerLM(nn.Module):
             d_model:int, 
             num_heads:int, 
             d_ff:int, 
-            theta:int = 10000.0,
+            theta:float = 10000.0,
     ):
         super().__init__()
         self.vocab_size = vocab_size
@@ -321,30 +294,12 @@ class TransformerLM(nn.Module):
         self.linear = Linear(d_model, vocab_size)
 
     def forward(self, 
-            weights:dict[str, Tensor], 
-            in_indices: Int[Tensor, " batch_size sequence_length"]
+            in_indices: Int[Tensor, "batch_size sequence_length"]
     ) -> Float[Tensor, "batch_size sequence_length vocab_size"]:
 
-        with torch.no_grad():
-            self.embeddings.embeddings.copy_(weights['token_embeddings.weight'])
-            self.norm.gains.copy_(weights['ln_final.weight'])
-            self.linear.weight.copy_(weights['lm_head.weight'])
-
         in_features = self.embeddings(in_indices)
-
         for num_layer in range(self.num_layers):
-            weights_i = {}
-            weights_i['attn.q_proj.weight'] = weights[f'layers.{num_layer}.attn.q_proj.weight']
-            weights_i['attn.k_proj.weight'] = weights[f'layers.{num_layer}.attn.k_proj.weight']
-            weights_i['attn.v_proj.weight'] = weights[f'layers.{num_layer}.attn.v_proj.weight']
-            weights_i['attn.output_proj.weight'] = weights[f'layers.{num_layer}.attn.output_proj.weight']
-            weights_i['ln1.weight'] = weights[f'layers.{num_layer}.ln1.weight']
-            weights_i['ffn.w1.weight'] = weights[f'layers.{num_layer}.ffn.w1.weight']
-            weights_i['ffn.w2.weight'] = weights[f'layers.{num_layer}.ffn.w2.weight']
-            weights_i['ffn.w3.weight'] = weights[f'layers.{num_layer}.ffn.w3.weight']
-            weights_i['ln2.weight'] = weights[f'layers.{num_layer}.ln2.weight']
-
-            in_features = self.transformerblock[num_layer](weights_i, in_features)
+            in_features = self.transformerblock[num_layer](in_features)
 
         out = self.linear(self.norm(in_features))
         return out
