@@ -1,111 +1,270 @@
 import regex as re
 import pickle
+import time
+from pathlib import Path
+import hashlib
+import json
 
-# TODO: 当跑完整数据集时，用 find_chunk_boundaries 和 multiprocessing 加速 pre_tokenization
 
-# GPT-2 采用的正则语言
 PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
 
 class BPE:
-    def __init__(self, input_path:str, vocab_size:int, special_tokens:list[str]):
-        self.input_path = input_path
+    def __init__(
+        self, 
+        vocab_size: int, 
+        special_tokens: list[str] | None, 
+    ):
+        self.special_tokens = special_tokens if special_tokens is not None else []
         self.vocab_size = vocab_size
-        self.special_tokens = special_tokens
+        self.words_freq = {}
+        
+        self.vocab: dict[int, bytes] = self._init_vocab(self.special_tokens)
+        self.merges: list[tuple[bytes, bytes]] = []
 
-    # 构建字节词表(dict)：数字 -> utf-8字节表述，输出词表
-    def init_vocab(self) -> dict[int, bytes]:
+    @staticmethod
+    def _init_vocab(
+        special_tokens: list[str] | None
+    ) -> dict[int, bytes]:
         vocab = {}
         for i in range(256):
             vocab[i] = bytes([i])
-            # 函数 bytes([value1, value2]) 的使用 其中 value 必须是 0～255 的数字；用字节类型有效解决“未登陆”词的问题
 
-
-        if self.special_tokens:
-            for i in range(len(self.special_tokens)):
-                vocab[256+i] = self.special_tokens[i].encode('utf-8')
-
+        if special_tokens is not None:
+            for i in range(len(special_tokens)):
+                vocab[256+i] = special_tokens[i].encode("utf-8")
         return vocab
-
-    # 预分词：把读取后的文本先根据 special_tokens 分开成 chunks，然后把每个 chunk 的每个 word 转为字节化 tuple 表述并统计 words 的总出现次，输出为：字节化 tuple word -> 统计次数
-    def pre_tokenization(self, content:str) -> dict[tuple[bytes, ...], int]:
+    
+    def _pre_tokenization(
+        self, 
+        content: str
+    ):
         if self.special_tokens:
-            pattern = '|'.join(re.escape(tok) for tok in self.special_tokens)
+            pattern = '|'.join(
+                re.escape(token) for token in sorted(
+                    self.special_tokens, key=lambda x:len(x), reverse=True
+                )
+            )
             chunks = re.split(pattern, content)
-            # chunks = re.split(f"({pattern})", content) 此时返回的列表会把分隔符本身也包含进去，类似 ['Hello world', '[MASK]', 'This is a test', '<SEP>', 'End of text']
-        
         else:
             chunks = [content]
-
-        word_freqs = {}
+    
+        count = 0 
         for chunk in chunks:
             for match in re.finditer(PAT, chunk):
                 word = match.group()
-                word_bytes = tuple(bytes([byte]) for byte in word.encode('utf-8'))
-                # dict 的 key 必须是不可变类型，所以要用 tuple 作为 dict 的 key 来统计单词的次数，tuple 中存了这个单词每个字符的 utf-8 的字节化表述
-                word_freqs[word_bytes] = word_freqs.get(word_bytes, 0) + 1
+                word_bytes = tuple(bytes([b]) for b in word.encode("utf-8"))
+                self.words_freq[word_bytes] = self.words_freq.get(word_bytes, 0) + 1
 
-        return word_freqs
+                count += 1
+                if count % 1_000_000 == 0:
+                    print(f"已处理 {count:,} 个 pre-tokens", flush=True)
 
-    # 统计相邻对：把两个相邻字母作为一组，统计这些两元素小组的出现频率
-    def count_pairs(self, word_freqs:dict[tuple[bytes, ...], int]) -> dict[tuple[bytes, bytes], int]:
-        pair_freqs = {}
+    @staticmethod
+    def _count_pair(
+        words_freq: dict[tuple[bytes, ...], int]
+    ) -> dict[tuple[bytes, bytes], int]:
+        pairs_freq = {}
+        for word_bytes, freq in words_freq.items():
+            for i in range(len(word_bytes)-1):
+                pair = tuple([word_bytes[i], word_bytes[i+1]])
+                pairs_freq[pair] = pairs_freq.get(pair, 0) + freq
+        return pairs_freq
 
-        for word_byte, freq in word_freqs.items():
-            for i in range(len(word_byte)-1):
-                pair = (word_byte[i], word_byte[i+1])
-                pair_freqs[pair] = pair_freqs.get(pair, 0) + freq
+    @staticmethod
+    def _find_best_pair(
+        pairs_freq: dict[tuple[bytes, bytes], int]
+    ) -> tuple[bytes, bytes]:
+        best_pair = max(pairs_freq, key = lambda pair: (pairs_freq[pair], pair))
+        return best_pair
 
-        return pair_freqs
-    
-    # 这里有问题：合并相邻对：通过 best_pair 比对 word_freqs 的 key（是一个 tuple）中频率最高的两个字符，然后合并他们，形成一个新的 word_freqs（由于一个二元 tuple 中两个字符成对出现，所以两者的 freq 相同），word tuple 的长度 - 1
-    def merge_pair(self, word_freqs:dict[tuple[bytes, ...], int], best_pair:tuple[bytes, bytes]) -> dict[tuple[bytes, ...], int]:
-        new_word_freqs = {}
+    @staticmethod
+    def _merge_pair(
+        word_bytes: tuple[bytes, ...], 
+        best_pair: tuple[bytes, bytes]
+    ) -> tuple[bytes, ...]:
+        new_word_bytes = []
+        pos = 0
+        while pos < len(word_bytes):
+            if pos < len(word_bytes)-1 and tuple([word_bytes[pos], word_bytes[pos+1]]) == best_pair:
+                new_word_bytes.append(word_bytes[pos] + word_bytes[pos+1])
+                pos += 2
+            else:
+                new_word_bytes.append(word_bytes[pos])
+                pos += 1
+        return tuple(new_word_bytes)
 
-        for word_byte, freq in word_freqs.items():
-            new_word = []
-            i = 0
-            while i < len(word_byte):
-                if i < len(word_byte)-1 and (word_byte[i], word_byte[i+1]) == best_pair:
-                    new_word.append(word_byte[i] + word_byte[i+1])
-                    i += 2
-                else:
-                    new_word.append(word_byte[i])
-                    i += 1
+    def _update_words_freq(
+        self, words_freq: dict[tuple[bytes, ...], int], 
+        best_pair: tuple[bytes, bytes]
+    ) -> dict[tuple[bytes, ...], int]:
+        new_words_freq = {}
+        for word_bytes, freq in words_freq.items():
+            new_word_bytes = self._merge_pair(word_bytes, best_pair)
+            new_words_freq[new_word_bytes] = new_words_freq.get(new_word_bytes, 0) + freq
+        return new_words_freq
 
-            new_word_freqs[tuple(new_word)] = freq
+    def train_bpe(
+        self, 
+        input_path: str
+    ) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
+        start = time.perf_counter()
+        # 三份状态放在同一目录；按输入文件及特殊 token 隔离，避免错用其他语料的存档
+        cache_path = self._get_cache_path(input_path, self.special_tokens)
+        checkpoint_dir = Path("./data/bpe_checkpoints") / cache_path.stem
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-        return new_word_freqs
+        # 从已有的最大有效词表快照恢复；目标大小可以高于已保存词表
+        resumed = False
+        saved_sizes = sorted(
+            (int(p.stem.split("_")[-1]) for p in checkpoint_dir.glob("bpe_vocab_*.pkl")
+             if p.stem.split("_")[-1].isdigit()),
+            reverse=True,
+        )
+        for size in saved_sizes:
+            if size > self.vocab_size:
+                continue
+            vocab_path = checkpoint_dir / f"bpe_vocab_{size}.pkl"
+            merges_path = checkpoint_dir / f"bpe_merges_{size}.pkl"
+            freq_path = checkpoint_dir / f"bpe_words_freq_{size}.pkl"
+            if not (merges_path.exists() and freq_path.exists()):
+                continue
+            self.vocab, self.merges, self.words_freq = self.load_data(
+                vocab_path, merges_path, freq_path
+            )
+            if len(self.vocab) != size:
+                raise ValueError(f"Invalid BPE checkpoint: {vocab_path}")
+            resumed = True
+            print(f"已从词表大小 {size} 恢复训练", flush=True)
+            break
 
-    # 训练 bpe：通过输入文本、词表长度、特殊 token，得到一个包含 merged pair 的新词表（序号 -> byte 化字符）vocab 以及一系列 best_pair 在 merge 前的二元 tuple
-    # 增量更新：修正方案：用增量更新（ where_to_update + pair_counts 维护）
-    def train_bpe(self) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
-        with open(self.input_path, mode='r', encoding='utf-8') as f:
-            content = f.read()
+        # ———————————————————————————————————————————————————————————————————————————————————— #
 
-        vocab = self.init_vocab()
-        word_freqs = self.pre_tokenization(content)
+        if not resumed:
+            print("开始读取语料...", flush=True)
+            with open(input_path, mode='r', encoding="utf-8") as f:
+                content = f.read()
+            print(f"读取完成：{time.perf_counter() - start:.2f}s")
 
-        merges = []
+        # ———————————————————————————————————————————————————————————————————————————————————— #
 
-        while len(vocab) < self.vocab_size:
-            
-            if len(vocab) % 300 == 0:
-                print(f"当前词表大小: {len(vocab)}, 当前进度：{len(vocab)/self.vocab_size}")
+        if not resumed:
+            print("开始预分词...", flush=True)
+            if cache_path.exists():
+                print("加载预分词缓存...", flush=True)
+                with cache_path.open("rb") as f:
+                    self.words_freq = pickle.load(f)
+            else:
+                print("开始读取和预分词...", flush=True)
+                self.words_freq = {}
+                self._pre_tokenization(content)
+                with cache_path.open("wb") as f:
+                    pickle.dump(self.words_freq, f, protocol=pickle.HIGHEST_PROTOCOL)
+            del content
+            print(
+                f"预分词完成：{time.perf_counter() - start:.2f}s, 不同 pre-token 数量：{len(self.words_freq)}",
+                flush=True,
+            )
 
-            pair_counts = self.count_pairs(word_freqs)
-            if not pair_counts:
+        # ———————————————————————————————————————————————————————————————————————————————————— #
+
+        print("开始 BPE 合并训练...", flush=True)
+        merge_start = time.perf_counter()
+
+        while len(self.vocab) < self.vocab_size:
+            if len(self.vocab) % 50 == 0:
+                print(
+                    f"""当前词表大小: {len(self.vocab)}, 当前进度：{100 * len(self.vocab)/self.vocab_size} %, 合并阶段耗时 {time.perf_counter() - merge_start:.1f}s""", 
+                    flush=True
+                )
+                
+            if len(self.vocab) in {10000, 20000, 30000}:
+                size = len(self.vocab)
+                self.save_data(
+                    self.vocab, self.merges, self.words_freq,
+                    checkpoint_dir / f"bpe_vocab_{size}.pkl",
+                    checkpoint_dir / f"bpe_merges_{size}.pkl",
+                    checkpoint_dir / f"bpe_words_freq_{size}.pkl",
+                )
+
+            pairs_freq = self._count_pair(self.words_freq)
+            if not pairs_freq:
                 break
 
-            best_pair = max(pair_counts, key = lambda p:(pair_counts[p], p))
-            word_freqs = self.merge_pair(word_freqs, best_pair)     # 更新词频字典
+            best_pair = self._find_best_pair(pairs_freq)
+            new_words_freq = self._update_words_freq(self.words_freq, best_pair)
+            self.words_freq = new_words_freq
 
-            vocab[len(vocab)] = best_pair[0] + best_pair[1]
-            merges.append(best_pair)
-               
-        return vocab, merges
+            self.vocab[len(self.vocab)] = best_pair[0]+best_pair[1]
+            self.merges.append(best_pair)
 
-    def save_file(self, vocab:dict[int, bytes], merges:list[tuple[bytes, bytes]], vocab_path:str, merges_path:str):
+        print(
+            f"""BPE 训练完成!! \n 最终词表大小: {len(self.vocab)}, 进度：{100 * len(self.vocab)/self.vocab_size} %, 总耗时：{time.perf_counter() - start:.2f}s""", 
+            flush=True
+        )
+        
+        size = len(self.vocab)
+        self.save_data(
+            self.vocab, self.merges, self.words_freq,
+            checkpoint_dir / f"bpe_vocab_{size}.pkl",
+            checkpoint_dir / f"bpe_merges_{size}.pkl",
+            checkpoint_dir / f"bpe_words_freq_{size}.pkl",
+        )
+        return self.vocab, self.merges
+
+    @staticmethod
+    def save_data(
+        vocab: dict[int, bytes],
+        merges: list[tuple[bytes, bytes]],
+        words_freq: dict[tuple[bytes, ...], int],
+        vocab_path: str | Path,
+        merges_path: str | Path,
+        words_freq_path: str | Path,
+    ):
         with open(vocab_path, 'wb') as f:
-            pickle.dump(vocab, f)
+            pickle.dump(vocab, f, protocol=pickle.HIGHEST_PROTOCOL)
         with open(merges_path, 'wb') as f:
-            pickle.dump(merges, f)
+            pickle.dump(merges, f, protocol=pickle.HIGHEST_PROTOCOL)
+        with open(words_freq_path, 'wb') as f:
+            pickle.dump(words_freq, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+    @staticmethod
+    def load_data(vocab_path, merges_path, words_freq_path):
+        with open(vocab_path, 'rb') as f:
+            vocab = pickle.load(f)
+        with open(merges_path, 'rb') as f:
+            merges = pickle.load(f)
+        with open(words_freq_path, 'rb') as f:
+            words_freq = pickle.load(f)
+        return vocab, merges, words_freq
+
+    def _get_cache_path(self, input_path: str | Path, special_tokens: list[str] | None):
+        path = Path(input_path).resolve()
+        stat = path.stat()
+
+        config = {
+            "path": str(path),
+            "size": stat.st_size,
+            "mtime_ns": stat.st_mtime_ns,
+            "special_tokens": special_tokens,
+            "pattern": PAT,
+        }
+
+        key = hashlib.sha256(
+            json.dumps(config, sort_keys=True).encode()
+        ).hexdigest()[:16]
+
+        cache_dir = Path("./data/bpe_cache")
+        cache_dir.mkdir(parents=True, exist_ok=True)
+
+        return cache_dir / f"words_freq_{key}.pkl"
+
+def train(input_path: str, vocab_size: int, special_tokens: list[str]):
+    bpe = BPE(vocab_size, special_tokens)
+    vocab, merges = bpe.train_bpe(input_path)
+
+if __name__ == "__main__":
+        train(
+            input_path="./data/TinyStoriesV2-GPT4-train.txt",
+            vocab_size=50000,
+            special_tokens=["<|endoftext|>"],
+        )
